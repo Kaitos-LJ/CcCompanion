@@ -88,7 +88,7 @@ final class FavoritesViewModel: ObservableObject {
             let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
             if !q.isEmpty { query.append(URLQueryItem(name: "q", value: q)) }
             comp.queryItems = query
-            let (data, _) = try await URLSession.shared.data(from: comp.url!)
+            let (data, _) = try await URLSession.shared.data(for: CcServerConfig.authenticatedRequest(url: comp.url!))
             let decoded = try await Task.detached {
                 try JSONDecoder().decode(FavoritesListResponse.self, from: data)
             }.value
@@ -565,7 +565,7 @@ struct FullImagePreview: View {
         saving = true
         defer { saving = false }
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            let (data, _) = try await URLSession.shared.data(for: CcServerConfig.authenticatedRequest(url: url))
             #if canImport(Photos) && os(iOS)
             try await PHPhotoLibrary.shared().performChanges {
                 let req = PHAssetCreationRequest.forAsset()

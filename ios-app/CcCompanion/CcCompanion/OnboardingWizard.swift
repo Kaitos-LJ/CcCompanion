@@ -256,7 +256,7 @@ struct OnboardingWizard: View {
                        let defaults = UserDefaults(suiteName: CcServerConfig.appGroup) {
                         defaults.set(url.absoluteString, forKey: "serverURL")
                         if !sharedSecretInput.isEmpty {
-                            defaults.set(sharedSecretInput, forKey: "sharedSecret")
+                            CcServerConfig.setSharedSecret(sharedSecretInput)
                         }
                     }
                     withAnimation { step = 5 }
@@ -341,7 +341,7 @@ struct OnboardingWizard: View {
            let defaults = UserDefaults(suiteName: CcServerConfig.appGroup) {
             defaults.set(url.absoluteString, forKey: "serverURL")
             if !sharedSecretInput.isEmpty {
-                defaults.set(sharedSecretInput, forKey: "sharedSecret")
+                CcServerConfig.setSharedSecret(sharedSecretInput)
             }
         }
         onboardingCompleted = true

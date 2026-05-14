@@ -69,10 +69,10 @@ from studyroom import StudyroomDB
 import subprocess
 import threading
 
-SCRIPTS_DIR = Path("/Users/mian/scripts")
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
-import rp_session_manager
+try:
+    import rp_session_manager
+except ImportError:
+    rp_session_manager = None
 
 
 HERE = Path(__file__).resolve().parent
@@ -479,21 +479,26 @@ class PushHandler(BaseHTTPRequestHandler):
         token = self.headers.get("X-Auth-Token", "") or self.headers.get("X-Auth", "")
         return token == self.state.shared_secret
 
-    def _require_write_auth(self) -> bool:
-        """Compatibility mode: warn without blocking until strict_auth=true."""
+    def _require_auth(self) -> bool:
         if self._auth_matches():
             return True
-        ip = self.client_address[0] if self.client_address else "unknown"
-        logger.warning(
-            "unauthenticated write allowed strict_auth=false ip=%s method=%s path=%s",
-            ip,
-            self.command,
-            self.path,
-        )
         if not self.state.strict_auth:
+            ip = self.client_address[0] if self.client_address else "unknown"
+            logger.warning(
+                "unauthenticated request allowed strict_auth=false ip=%s method=%s path=%s",
+                ip,
+                self.command,
+                self.path,
+            )
             return True
-        self._send_json(403, {"error": "auth required"})
+        self._send_json(401, {"error": "unauthorized"})
         return False
+
+    def _require_write_auth(self) -> bool:
+        return self._require_auth()
+
+    def _is_public_get(self) -> bool:
+        return self.path in {"/health", "/version"}
 
     def _check_ip_allowed(self) -> bool:
         allowed = self.state.allowed_ips
@@ -530,7 +535,9 @@ class PushHandler(BaseHTTPRequestHandler):
     # ---------- routes ----------
 
     def do_GET(self):
-        if self.path != "/health" and not self._check_ip_allowed():
+        if not self._is_public_get() and not self._check_ip_allowed():
+            return
+        if not self._is_public_get() and not self._require_auth():
             return
         if self.path == "/task/list":
             self._send_json(200, self.state.tasks.snapshot())
@@ -771,6 +778,9 @@ class PushHandler(BaseHTTPRequestHandler):
                     "bundle_id": self.state.bundle_id,
                 },
             )
+            return
+        if self.path == "/version":
+            self._send_json(200, {"ok": True, "version": self.server_version})
             return
         if self.path == "/web/chat" or self.path.startswith("/web/chat?"):
             self._serve_web_chat()
@@ -1918,13 +1928,23 @@ class PushHandler(BaseHTTPRequestHandler):
 
     # ---------- RP handlers ----------
 
+    def _require_rp_manager(self) -> bool:
+        if rp_session_manager is not None:
+            return True
+        self._send_json(501, {"error": "rp_session_manager not installed"})
+        return False
+
     def _rp_chain_append(self, sid: str, rec: dict[str, Any]) -> None:
+        if rp_session_manager is None:
+            raise RuntimeError("rp_session_manager not installed")
         chain_path = rp_session_manager.active_dir(sid) / "chain.jsonl"
         chain_path.parent.mkdir(parents=True, exist_ok=True)
         with chain_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     def _handle_rp_new(self, body: dict[str, Any]):
+        if not self._require_rp_manager():
+            return
         seed = str(body.get("character_seed") or "").strip()
         if not seed:
             self._send_json(400, {"error": "character_seed required"})
@@ -1937,6 +1957,8 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": str(e)})
 
     def _handle_rp_send(self, body: dict[str, Any]):
+        if not self._require_rp_manager():
+            return
         sid = str(body.get("sid") or "").strip()
         text = str(body.get("text") or "").strip()
         try:
@@ -2000,6 +2022,8 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": str(e)})
 
     def _handle_rp_append(self, body: dict[str, Any]):
+        if not self._require_rp_manager():
+            return
         sid = str(body.get("sid") or "").strip()
         role = str(body.get("role") or "assistant").strip()
         text = str(body.get("text") or "").strip()
@@ -2038,6 +2062,8 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": str(e)})
 
     def _handle_rp_archive(self, body: dict[str, Any]):
+        if not self._require_rp_manager():
+            return
         sid = str(body.get("sid") or "").strip()
         try:
             sid = validate_rp_sid(sid)
@@ -2054,6 +2080,8 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": str(e)})
 
     def _handle_rp_list(self):
+        if not self._require_rp_manager():
+            return
         try:
             self._send_json(200, {
                 "ok": True,

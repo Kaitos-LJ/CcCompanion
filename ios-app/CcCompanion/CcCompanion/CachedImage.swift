@@ -69,7 +69,7 @@ struct CachedImage<Placeholder: View, Content: View>: View {
             return
         }
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            let (data, _) = try await URLSession.shared.data(for: CcServerConfig.authenticatedRequest(url: url))
             if let img = UIImage(data: data) {
                 ImageCache.shared.set(url, image: img)
                 self.loaded = img

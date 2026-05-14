@@ -250,7 +250,7 @@ struct UsageBanner: View {
     private func fetchOnce() async {
         let url = CcServerConfig.serverURL.appendingPathComponent("usage/active")
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            let (data, _) = try await URLSession.shared.data(for: CcServerConfig.authenticatedRequest(url: url))
             let decoded = try JSONDecoder().decode(UsageActiveResponse.self, from: data)
             await MainActor.run {
                 self.active = decoded.active

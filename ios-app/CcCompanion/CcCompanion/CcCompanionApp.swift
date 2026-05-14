@@ -15,9 +15,15 @@ struct CcCompanionApp: App {
 
     init() {
         // Phase multi-server fallback (2026-05-11) — 旧版单 serverURL 一次性迁到新 endpoints 列表.
+        CcServerConfig.migrateLegacySharedSecretIfNeeded()
         CcServerConfig.migrateLegacySingleURLIfNeeded()
         CcServerConfig.syncToAppGroup()
         Self.registerCustomFonts()
+        #if os(iOS) && !targetEnvironment(macCatalyst)
+        Task { @MainActor in
+            PushTokenManager.shared.requestAuthorization()
+        }
+        #endif
     }
 
     private static func registerCustomFonts() {

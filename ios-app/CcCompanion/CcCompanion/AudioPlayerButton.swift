@@ -33,7 +33,7 @@ final class AudioPlayerCoordinator: NSObject, ObservableObject, AVAudioPlayerDel
         currentURL = url
         Task { @MainActor in
             do {
-                let (data, _) = try await URLSession.shared.data(from: url)
+                let (data, _) = try await URLSession.shared.data(for: CcServerConfig.authenticatedRequest(url: url))
                 #if os(iOS)
                 try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
                 try? AVAudioSession.sharedInstance().setActive(true)
@@ -46,9 +46,10 @@ final class AudioPlayerCoordinator: NSObject, ObservableObject, AVAudioPlayerDel
                 self.progress = 0
                 self.timer?.invalidate()
                 self.timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-                    Task { @MainActor in
-                        guard let self = self, let p = self.player else { return }
-                        self.progress = p.duration > 0 ? p.currentTime / p.duration : 0
+                    guard let coordinator = self else { return }
+                    Task { @MainActor [weak coordinator] in
+                        guard let coordinator, let p = coordinator.player else { return }
+                        coordinator.progress = p.duration > 0 ? p.currentTime / p.duration : 0
                     }
                 }
             } catch {

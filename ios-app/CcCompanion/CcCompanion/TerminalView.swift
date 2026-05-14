@@ -47,7 +47,7 @@ final class TerminalViewModel: ObservableObject {
     func fetchSessions() async {
         let url = CcServerConfig.serverURL.appendingPathComponent("tmux/sessions")
         do {
-            let (data, _) = try await urlSession.data(from: url)
+            let (data, _) = try await urlSession.data(for: CcServerConfig.authenticatedRequest(url: url))
             if let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                let arr = obj["sessions"] as? [String] {
                 self.sessions = arr
@@ -66,7 +66,7 @@ final class TerminalViewModel: ObservableObject {
         ]
         guard let url = components?.url else { return }
         do {
-            let (data, _) = try await urlSession.data(from: url)
+            let (data, _) = try await urlSession.data(for: CcServerConfig.authenticatedRequest(url: url))
             if let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                let txt = obj["content"] as? String {
                 self.content = txt

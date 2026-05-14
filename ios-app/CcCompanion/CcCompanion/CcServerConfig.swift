@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 /// Server configuration used by the app and app group storage.
 /// Phase multi-server fallback (2026-05-11): `serverURL` reads endpoint list and
@@ -9,6 +10,9 @@ nonisolated public enum CcServerConfig {
     private static let kServerURLList = "serverURLList"
     private static let kServerLabelList = "serverLabelList"
     private static let kServerActiveIndex = "serverActiveIndex"
+    private static let kLegacySharedSecret = "sharedSecret"
+    private static let keychainService = "com.starryfield.cccompanion"
+    private static let keychainAccount = "ccc-shared-secret"
 
     private static let placeholderURL = URL(string: "http://example.com:8795")!
 
@@ -56,18 +60,50 @@ nonisolated public enum CcServerConfig {
     }
 
     public static var sharedSecret: String? {
-        if let s = UserDefaults(suiteName: appGroup)?.string(forKey: "sharedSecret") {
+        if let s = keychainSharedSecret(), !s.isEmpty {
             return s
         }
+        if let migrated = migrateLegacySharedSecretIfNeeded(), !migrated.isEmpty {
+            return migrated
+        }
         return Bundle.main.infoDictionary?["CC_PUSH_SECRET"] as? String
+    }
+
+    public static func setSharedSecret(_ secret: String?) {
+        let trimmed = (secret ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            deleteKeychainSharedSecret()
+        } else {
+            setKeychainSharedSecret(trimmed)
+        }
+        UserDefaults(suiteName: appGroup)?.removeObject(forKey: kLegacySharedSecret)
+    }
+
+    public static func authenticatedRequest(url: URL, method: String = "GET") -> URLRequest {
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        if let secret = sharedSecret, !secret.isEmpty {
+            request.setValue(secret, forHTTPHeaderField: "X-Auth-Token")
+        }
+        return request
+    }
+
+    @discardableResult
+    public static func migrateLegacySharedSecretIfNeeded() -> String? {
+        guard let defaults = UserDefaults(suiteName: appGroup),
+              let legacy = defaults.string(forKey: kLegacySharedSecret),
+              !legacy.isEmpty else {
+            return nil
+        }
+        setKeychainSharedSecret(legacy)
+        defaults.removeObject(forKey: kLegacySharedSecret)
+        return legacy
     }
 
     public static func syncToAppGroup() {
         guard let defaults = UserDefaults(suiteName: appGroup) else { return }
         defaults.set(serverURL.absoluteString, forKey: "serverURL")
-        if let sharedSecret {
-            defaults.set(sharedSecret, forKey: "sharedSecret")
-        }
+        migrateLegacySharedSecretIfNeeded()
     }
 
     @discardableResult
@@ -91,5 +127,46 @@ nonisolated public enum CcServerConfig {
         if url.contains("10.") || url.contains("192.168.") { return "LAN" }
         if url.contains("localhost") || url.contains("127.0.0.1") { return "Local" }
         return "Server"
+    }
+
+    private static func keychainQuery() -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: keychainAccount,
+        ]
+    }
+
+    private static func keychainSharedSecret() -> String? {
+        var query = keychainQuery()
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess,
+              let data = item as? Data,
+              let secret = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return secret
+    }
+
+    private static func setKeychainSharedSecret(_ secret: String) {
+        let data = Data(secret.utf8)
+        let attrs: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        ]
+        let status = SecItemUpdate(keychainQuery() as CFDictionary, attrs as CFDictionary)
+        if status == errSecItemNotFound {
+            var query = keychainQuery()
+            query[kSecValueData as String] = data
+            query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            SecItemAdd(query as CFDictionary, nil)
+        }
+    }
+
+    private static func deleteKeychainSharedSecret() {
+        SecItemDelete(keychainQuery() as CFDictionary)
     }
 }

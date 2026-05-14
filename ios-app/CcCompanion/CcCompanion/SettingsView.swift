@@ -99,7 +99,7 @@ final class UsageSectionViewModel: ObservableObject {
         defer { loading = false }
         let url = CcServerConfig.serverURL.appendingPathComponent("usage")
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            let (data, _) = try await URLSession.shared.data(for: CcServerConfig.authenticatedRequest(url: url))
             let decoded = try JSONDecoder().decode(UsageOverviewResponse.self, from: data)
             response = decoded
         } catch {
@@ -292,7 +292,7 @@ final class CcSettingsViewModel: ObservableObject {
     func checkHealth() async {
         let url = CcServerConfig.serverURL.appendingPathComponent("health")
         do {
-            let (_, resp) = try await URLSession.shared.data(from: url)
+            let (_, resp) = try await URLSession.shared.data(for: CcServerConfig.authenticatedRequest(url: url))
             healthOk = (resp as? HTTPURLResponse)?.statusCode == 200
         } catch {
             healthOk = false
@@ -310,7 +310,7 @@ final class CcSettingsViewModel: ObservableObject {
     private func fetch(_ path: String, apply: @escaping ([String: Any]) -> Void) async {
         let url = CcServerConfig.serverURL.appendingPathComponent(path)
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            let (data, _) = try await URLSession.shared.data(for: CcServerConfig.authenticatedRequest(url: url))
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 apply(json)
             }

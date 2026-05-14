@@ -470,12 +470,14 @@ actor ChatNetworkClient {
         if let etag { items.append(URLQueryItem(name: "etag", value: etag)) }
         components?.queryItems = items
         guard let finalURL = components?.url else { throw URLError(.badURL) }
-        let (data, _) = try await session.data(from: finalURL)
+        var request = CcServerConfig.authenticatedRequest(url: finalURL)
+        request.timeoutInterval = 30
+        let (data, _) = try await session.data(for: request)
         return try JSONDecoder().decode(ChatPollResponse.self, from: data)
     }
 
     func fetchHistory(url: URL) async throws -> [ChatMessage] {
-        var request = URLRequest(url: url)
+        var request = CcServerConfig.authenticatedRequest(url: url)
         request.timeoutInterval = 30
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
@@ -986,7 +988,7 @@ final class ChatViewModel: ObservableObject {
     private func fetchSoundSettings() async {
         let url = CcServerConfig.serverURL.appendingPathComponent("settings")
         do {
-            let (data, _) = try await session.data(from: url)
+            let (data, _) = try await session.data(for: CcServerConfig.authenticatedRequest(url: url))
             if let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                let s = obj["settings"] as? [String: Any] {
                 let chat = s["chat_sound_enabled"] as? Bool ?? true
@@ -1033,7 +1035,7 @@ final class ChatViewModel: ObservableObject {
     private func fetchTyping() async {
         let url = CcServerConfig.serverURL.appendingPathComponent("chat/typing")
         do {
-            let (data, _) = try await session.data(from: url)
+            let (data, _) = try await session.data(for: CcServerConfig.authenticatedRequest(url: url))
             if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let isTyping = obj["is_typing"] as? Bool {
                 self.isCcTyping = isTyping
@@ -1046,7 +1048,7 @@ final class ChatViewModel: ObservableObject {
     private func fetchStatus() async {
         let url = CcServerConfig.serverURL.appendingPathComponent("chat/status")
         do {
-            let (data, _) = try await session.data(from: url)
+            let (data, _) = try await session.data(for: CcServerConfig.authenticatedRequest(url: url))
             if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let status = obj["status"] as? String {
                 self.ccStatus = status
@@ -1262,7 +1264,7 @@ final class ChatViewModel: ObservableObject {
         components?.queryItems = items
         guard let finalURL = components?.url else { return }
         do {
-            let (data, _) = try await session.data(from: finalURL)
+            let (data, _) = try await session.data(for: CcServerConfig.authenticatedRequest(url: finalURL))
             let decoded = try JSONDecoder().decode(ChatHistoryResponse.self, from: data)
             if !decoded.records.isEmpty {
                 self.mergeUnique(decoded.records)
@@ -1417,7 +1419,7 @@ final class ChatViewModel: ObservableObject {
         ]
         guard let finalURL = components?.url else { return }
         do {
-            let (data, _) = try await session.data(from: finalURL)
+            let (data, _) = try await session.data(for: CcServerConfig.authenticatedRequest(url: finalURL))
             let decoded = try JSONDecoder().decode(ChatHistoryResponse.self, from: data)
             self.serverSearchResults = decoded.records
             // 顺手缓存到本地
@@ -1453,7 +1455,7 @@ final class ChatViewModel: ObservableObject {
             ]
             guard let finalURL = components?.url else { break }
             do {
-                let (data, _) = try await session.data(from: finalURL)
+                let (data, _) = try await session.data(for: CcServerConfig.authenticatedRequest(url: finalURL))
                 let resp = try JSONDecoder().decode(ChatHistoryResponse.self, from: data)
                 if resp.records.isEmpty {
                     emptyHits += 1
@@ -1502,7 +1504,7 @@ final class ChatViewModel: ObservableObject {
             URLQueryItem(name: "limit", value: "1"),
         ]
         if let finalURL = components?.url,
-           let (data, _) = try? await session.data(from: finalURL),
+           let (data, _) = try? await session.data(for: CcServerConfig.authenticatedRequest(url: finalURL)),
            let decoded = try? JSONDecoder().decode(ChatHistoryResponse.self, from: data),
            let first = decoded.records.first {
             await jumpToMessage(first)
@@ -1537,7 +1539,7 @@ final class ChatViewModel: ObservableObject {
             ]
             if let finalURL = components?.url {
                 do {
-                    let (data, _) = try await session.data(from: finalURL)
+                    let (data, _) = try await session.data(for: CcServerConfig.authenticatedRequest(url: finalURL))
                     let decoded = try JSONDecoder().decode(ChatHistoryResponse.self, from: data)
                     aroundMsgs = decoded.records
                     chatStore.upsert(decoded.records)
@@ -6063,7 +6065,7 @@ struct ImagePreviewView: View {
 
     private func loadImage() async {
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            let (data, _) = try await URLSession.shared.data(for: CcServerConfig.authenticatedRequest(url: url))
             if let img = UIImage(data: data) {
                 await MainActor.run { loadedImage = img }
             }
@@ -6665,7 +6667,7 @@ struct ImageGridSection: View {
     private func saveImage(from url: URL) {
         Task {
             do {
-                let (data, _) = try await URLSession.shared.data(from: url)
+                let (data, _) = try await URLSession.shared.data(for: CcServerConfig.authenticatedRequest(url: url))
                 if let img = UIImage(data: data) {
                     await MainActor.run {
                         UIImageWriteToSavedPhotosAlbum(img, nil, nil, nil)
