@@ -3688,6 +3688,14 @@ class PushHandler(BaseHTTPRequestHandler):
         if metadata and not isinstance(metadata, dict):
             metadata = None
 
+        # Phase 3 (thinking-stream-render): assistant ios_reply 落记录时生成 turn_id,
+        # 透传给 iOS (经 /chat/poll new_records 的 top-level turn_id) 跟 chain hook
+        # (POST /v1/thinking?turn_id=<id> 时用同一 id 对齐). 客户端可带 turn_id 复用.
+        reply_turn_id = None
+        if role == "assistant":
+            import uuid as _uuid_turn
+            reply_turn_id = (body.get("turn_id") or "").strip() or _uuid_turn.uuid4().hex
+
         rec = self.state.chat.append(
             role=role,
             text=text,
@@ -3696,6 +3704,7 @@ class PushHandler(BaseHTTPRequestHandler):
             attachment_type=attachment_type,
             attachment_filename=attachment_filename,
             metadata=metadata,
+            turn_id=reply_turn_id,
         )
 
         # move 成功 append 后缓存 client_msg_id (LRU 100)
@@ -3798,7 +3807,7 @@ class PushHandler(BaseHTTPRequestHandler):
         # 立刻 ACK
         _ack_ms = int((time.time() - _req_t0) * 1000)
         print(f"chat_append_ms={_ack_ms} dedupe_hit=0 role={role}", file=sys.stderr, flush=True)
-        self._send_json(200, {"ok": True, "record": rec})
+        self._send_json(200, {"ok": True, "record": rec, "turn_id": reply_turn_id})
 
         # ACK 之后再起异步线程做 APNs / notification 不影响 client 5s timeout
         threading.Thread(target=_async_side_effects, daemon=True).start()
