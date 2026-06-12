@@ -319,6 +319,10 @@ nonisolated struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
     let audioJa: String?
     let location: ChatLocation?
     let metadata: ChatMetadata?
+    // Phase 3 (thinking-stream-render): server 给 assistant ios_reply 生成的 turn_id.
+    // iOS 用它向 GET /v1/thinking?turn_id=<id> 拉对应 thinking 文本, 对齐到这条 reply.
+    // 非 assistant / 旧记录为 nil. 不进 GRDB (transient, 实时 poll 带来).
+    var turnId: String? = nil
     // 2026-05-12 optimistic-send sort-fix: `ts` now holds the real ISO send
     // timestamp (so failed bubbles sort chronologically alongside server records
     // instead of permanently gluing to the bottom via `local-` lex tail).
@@ -338,6 +342,7 @@ nonisolated struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
         case audioJa = "audio_ja"
         case location
         case metadata
+        case turnId = "turn_id"
         case localId = "local_id"
     }
 
@@ -497,6 +502,38 @@ actor ChatNetworkClient {
         let decoded = try? JSONDecoder().decode(ChatViewModel.ChatSendResponse.self, from: data)
         return decoded?.record
     }
+
+    // Phase 3 (thinking-stream-render): 按 turn_id 拉 thinking 文本.
+    // server GET /v1/thinking?turn_id=<id>&limit=<n> 返回 records (phase 1 已上线).
+    // 同一 turn 可能多条 thinking record, 按 created_at 顺序拼接.
+    func fetchThinking(turnId: String, limit: Int = 50) async -> String? {
+        let url = CcServerConfig.serverURL.appendingPathComponent("v1/thinking")
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "turn_id", value: turnId),
+            URLQueryItem(name: "limit", value: String(limit)),
+        ]
+        guard let finalURL = components?.url else { return nil }
+        var request = CcServerConfig.authenticatedRequest(url: finalURL)
+        request.timeoutInterval = 20
+        guard let (data, response) = try? await session.data(for: request),
+              let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+              let decoded = try? JSONDecoder().decode(ThinkingFetchResponse.self, from: data)
+        else { return nil }
+        let joined = decoded.records
+            .map { $0.thinking }
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .joined(separator: "\n\n")
+        return joined.isEmpty ? nil : joined
+    }
+
+    private struct ThinkingFetchResponse: Codable {
+        let records: [ThinkingRecord]
+    }
+    private struct ThinkingRecord: Codable {
+        let turn_id: String?
+        let thinking: String
+    }
 }
 
 struct ToolStack: Identifiable, Hashable {
@@ -601,6 +638,45 @@ final class ChatViewModel: ObservableObject {
     @Published var hasMoreEarlier: Bool = true
     @Published var uploadQueue: [PendingUpload] = []
     @Published private(set) var displayedRowsCache: [ChatRowItem] = []
+    // Phase 3 (thinking-stream-render): turn_id → 拉到的 thinking 文本. ThinkingChip 读这里.
+    @Published private(set) var thinkingByTurn: [String: String] = [:]
+    // 已"终态"的 turn_id (拿到非空文本, 或退避重试耗尽 give up) — 不再拉.
+    private var thinkingFetchedTurns: Set<String> = []
+    // 正在重试循环中的 turn_id, 防 push + poll 双触发起重复循环.
+    private var thinkingInFlightTurns: Set<String> = []
+    // 2026-06-11 thinking 占位动画: 该 turn thinking 在路上但还没拉到 → anchor 位显示「正在思考」占位.
+    // 2026-06-12 bug 修: Set<String> → [tid: 插入时刻]. 渲染层无视超 thinkingPlaceholderMaxAge 的过期项,
+    // scenePhase 转 .active / 每次 poll tick 主动清扫, 根除"任务死掉占位永不消失"(H3 / bug2 不死占位).
+    @Published private(set) var thinkingPlaceholderSince: [String: Date] = [:]
+    // 占位最长存活: 与 ~89s give-up 退避窗对齐略宽, 超过即视为僵尸占位清掉.
+    private let thinkingPlaceholderMaxAge: TimeInterval = 95
+    // 新鲜度门 (H1 / bug1): 仅当 turn 第一条气泡 ts 距 now ≤ 此窗才给占位, 历史回填静默拉卡片不冒占位.
+    private let thinkingFreshTurnWindow: TimeInterval = 120
+    // 渲染层判定: 该 turn 当前是否应显示占位 (存在且未过期).
+    func showsThinkingPlaceholder(_ tid: String) -> Bool {
+        guard let since = thinkingPlaceholderSince[tid] else { return false }
+        return Date().timeIntervalSince(since) < thinkingPlaceholderMaxAge
+    }
+    // 连续 N 个 turn 拉空 → 判定此 server 无 thinking 管道, 后续不显示占位 (UserDefaults 持久, 真拉到内容即重置).
+    private var consecutiveEmptyThinkingTurns: Int = 0
+    private let thinkingEmptyTurnThreshold = 3
+    private static let noThinkingPipelineKey = "cc_no_thinking_pipeline"
+    private var noThinkingPipeline: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.noThinkingPipelineKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.noThinkingPipelineKey) }
+    }
+    // Phase 3 (build 223): silent push 带 turn_id 到达 → 直接拉 thinking, 不等下一次 chat poll.
+    private var thinkingPushObserver: NSObjectProtocol?
+
+    init() {
+        thinkingPushObserver = NotificationCenter.default.addObserver(
+            forName: .ccThinkingPending, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let tid = note.userInfo?["turn_id"] as? String, !tid.isEmpty else { return }
+            // force: silent push 代表 server 此刻已有这条 thinking, 即使 poll 路已 give-up 也要补拉.
+            Task { @MainActor in self?.fetchThinkingForTurn(tid, force: true) }
+        }
+    }
     @Published private(set) var visibleLimit: Int = 300 { didSet { rebuildDisplayedRowsCache() } }
 
     var connectionStatus: ChatConnectionStatus {
@@ -964,6 +1040,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     private func pollOnce() async {
+        sweepStaleThinkingPlaceholders()   // H3 兜底: 每 tick 清扫僵尸占位, 不依赖 scenePhase 变化
         do {
             let response = try await ChatNetworkClient.shared.fetchPoll(since: lastTs, etag: settingsEtag)
             recordNetworkSuccess()
@@ -982,6 +1059,7 @@ final class ChatViewModel: ObservableObject {
                 notifyPollingAssistantMessages(response.chat.newRecords, existingIds: existingIds)
                 reconcileLocalSendState()
                 await refreshRecent()
+                fetchThinkingForNewTurns(response.chat.newRecords)
                 lastError = nil
             } else if let last = response.chat.lastTs, (lastTs ?? "") < last {
                 lastTs = last
@@ -991,6 +1069,152 @@ final class ChatViewModel: ObservableObject {
             pollingFailureCount += 1
             objectWillChange.send()
         }
+    }
+
+    // Phase 3 (thinking-stream-render): 新到的 assistant 记录带 turn_id 的, 异步拉 thinking.
+    // silent push (content-available) 到达后也走 fetchThinkingForTurn, 所以 push / 普通 poll 都覆盖.
+    func fetchThinkingForNewTurns(_ records: [ChatMessage]) {
+        let turnIds = records.compactMap { rec -> String? in
+            guard rec.role == "assistant", let tid = rec.turnId, !tid.isEmpty else { return nil }
+            return tid
+        }
+        for tid in Set(turnIds) { fetchThinkingForTurn(tid) }
+    }
+
+    // 单 turn 拉 thinking, 带长退避重试. silent push handler 也调这条 (按 payload turn_id, 不依赖 chat record).
+    // build 227 修竞态根因 (旁白方案 livefix):
+    //   现象: thinking 已落库 + UI 好的, 但卡片不冒. 真因两条耦合:
+    //   ① thinking 是 chain Stop hook 收尾才 POST, 比消息气泡晚到 ~30s; 旧退避 [0,1,2,5]=8s 窗在数据落库前就跑完.
+    //   ② 退避耗尽 give up 时把 tid 标进 thinkingFetchedTurns — 跟"成功"用同一个 set — 于是随后 silent push 到达,
+    //      observer 调到这里, line guard 见 fetchedTurns.contains(tid) 直接短路, push 永远救不回这条 turn.
+    //   实测: silent push 对有效 token PROD status=200 真送达, 所以问题不在 push 没到, 在到了被 give-up 标记挡掉.
+    //   修法: ① 退避窗拉到累计 ~89s 覆盖晚到 30s 的窗 (不靠 push 也自愈); ② push 走 force=true 清掉 give-up 标记补拉.
+    // 占位新鲜度 (H1 / bug1): 该 turn 第一条 assistant 气泡 ts 距 now ≤ thinkingFreshTurnWindow 才算新鲜.
+    // 冷启动 / 切回前台首 poll 的历史批量回填里, 老 turn 不新鲜 → 静默拉卡片但不冒占位, 修"历史气泡集体冒占位".
+    private static let thinkingFreshFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
+    }()
+    private func isFreshThinkingTurn(_ tid: String) -> Bool {
+        guard let firstTs = messages.first(where: { $0.turnId == tid && $0.role == "assistant" })?.ts else {
+            return true   // 气泡还没落地 (push 先于 chat record) → 视作新鲜, 允许占位
+        }
+        guard let date = Self.parseChatDate(firstTs, formatter: Self.thinkingFreshFormatter) else { return true }
+        return Date().timeIntervalSince(date) <= thinkingFreshTurnWindow
+    }
+
+    // 当前批次头 turn_id: messages 里最后一条 user 消息之后, 按 (ts,id) 确定性排序第一条 assistant 的 turn_id.
+    // 无 user 消息 → 定不了批次头, 返回 nil (调用方放行, 维持现行为).
+    private func currentBatchHeadTurnId() -> String? {
+        guard let lastUserTs = messages.filter({ $0.role == "user" }).map(\.ts).max() else { return nil }
+        return messages
+            .filter { $0.role == "assistant" && $0.turnId != nil && $0.ts > lastUserTs }
+            .min(by: { ($0.ts, $0.id) < ($1.ts, $1.id) })?
+            .turnId
+    }
+
+    // batch-head 门 (1125 收尾): 占位只给批次头. case (b) 下姊妹气泡各自一个 turn_id, 但 stop hook 一个 chain turn
+    // 只 POST 一次 thinking, 落在批次头的 turn_id 上 → 非头的姊妹气泡 GET /v1/thinking 永远 records:[], 占位是空欢喜.
+    // 放行例外 (维持 dd320c8 现行为, 别误杀): ① 该 tid 气泡还没落地 (push 先于 chat record, messages 查无);
+    // ② 找不到 user 消息定不了批次头 (如 reminder 触发的连续主动 turn). 已知 tradeoff: 连续两 turn 中间无 user 时,
+    // 第二个 turn 的头不是"最后 user 之后第一条" → 拿不到占位, 卡片照常冒, 接受.
+    private func passesBatchHeadGate(_ tid: String) -> Bool {
+        guard messages.contains(where: { $0.turnId == tid && $0.role == "assistant" }) else { return true }
+        guard let head = currentBatchHeadTurnId() else { return true }
+        return head == tid
+    }
+
+    func fetchThinkingForTurn(_ tid: String, force: Bool = false) {
+        guard !tid.isEmpty else { return }
+        if thinkingByTurn[tid] != nil { return }          // 已成功拉到 → 不重复
+        // silent push 代表"server 此刻已有这条 thinking" → 即使 poll 路已 give-up 也允许重新拉.
+        if force { thinkingFetchedTurns.remove(tid) }
+        if thinkingFetchedTurns.contains(tid) || thinkingInFlightTurns.contains(tid) { return }
+        thinkingInFlightTurns.insert(tid)
+        // 占位: 初次 poll 路 (非 force push 路) + 未判定无管道 + 该 turn 新鲜 (H1) + 是批次头 (1125) 才冒占位.
+        // 历史回填老 turn 不新鲜 → 只静默 fetch 不插占位; 新鲜批次的非头姊妹气泡 → 拿不到 thinking, 不插占位免空欢喜.
+        if !force && !noThinkingPipeline && isFreshThinkingTurn(tid) && passesBatchHeadGate(tid) {
+            thinkingPlaceholderSince[tid] = Date()
+        }
+        Task { [weak self] in
+            // 退避累计 ~89s: 0,1,3,6,11,19,29,44,64,89s — 在 thinking 晚到 ~30s 前后多次 catch, 不靠 flaky push.
+            let delays: [UInt64] = [0, 1, 2, 3, 5, 8, 10, 15, 20, 25].map { UInt64($0) * 1_000_000_000 }
+            for (i, delay) in delays.enumerated() {
+                if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+                if let text = await ChatNetworkClient.shared.fetchThinking(turnId: tid) {
+                    await MainActor.run { self?.thinkingTurnLoaded(tid, text: text) }
+                    return
+                }
+                // 退避耗尽仍空 → 标 give-up 停 poll 循环 (防无限轮询); silent push 可用 force 重置再拉.
+                if i == delays.count - 1 {
+                    await MainActor.run { self?.thinkingTurnGaveUp(tid) }
+                }
+            }
+        }
+    }
+
+    // 拉到非空 thinking → 卡片原地替占位; 重置「无管道」判定.
+    @MainActor private func thinkingTurnLoaded(_ tid: String, text: String) {
+        thinkingByTurn[tid] = text
+        thinkingFetchedTurns.insert(tid)
+        thinkingInFlightTurns.remove(tid)
+        thinkingPlaceholderSince.removeValue(forKey: tid)
+        consecutiveEmptyThinkingTurns = 0
+        noThinkingPipeline = false
+    }
+
+    // 退避耗尽仍空 → 占位淡出; 连续 N 个 turn 全空则判定此 server 无 thinking 管道 (持久, 拉到内容即重置).
+    @MainActor private func thinkingTurnGaveUp(_ tid: String) {
+        thinkingFetchedTurns.insert(tid)
+        thinkingInFlightTurns.remove(tid)
+        withAnimation(.easeOut(duration: 0.45)) { _ = thinkingPlaceholderSince.removeValue(forKey: tid) }
+        if noThinkingPipeline == false {
+            consecutiveEmptyThinkingTurns += 1
+            if consecutiveEmptyThinkingTurns >= thinkingEmptyTurnThreshold { noThinkingPipeline = true }
+        }
+    }
+
+    // H3 兜底 (bug2 不死占位): 清扫超 maxAge 的僵尸占位 (任务被取消 / weak self 拿空 / 竞态没跑到 give-up),
+    // 并解开卡死的 in-flight 标记, 允许后续 push/poll 重新拉. 每次 poll tick + scenePhase 转 .active 调.
+    @MainActor func sweepStaleThinkingPlaceholders() {
+        let now = Date()
+        let stale = thinkingPlaceholderSince.compactMap {
+            now.timeIntervalSince($0.value) >= thinkingPlaceholderMaxAge ? $0.key : nil
+        }
+        guard !stale.isEmpty else { return }
+        withAnimation(.easeOut(duration: 0.45)) {
+            for tid in stale { thinkingPlaceholderSince.removeValue(forKey: tid) }
+        }
+        for tid in stale { thinkingInFlightTurns.remove(tid) }
+    }
+
+    // H3 (bug2): 切回前台校正占位. 三类处理: ① 已有卡片 → 清残留占位; ② 占位还在但任务没了 (后台被取消) →
+    // 清旧占位 + force=false 重新发起 (重置占位戳 + 退避); ③ 任务仍在途 → 保留占位 (在途行为正常, 符合验收4).
+    // 根除"切屏回来留一个永远在动的占位", 不误杀真在途的占位.
+    @MainActor func reconcileThinkingOnForeground() {
+        sweepStaleThinkingPlaceholders()
+        for tid in Array(thinkingPlaceholderSince.keys) {
+            if thinkingByTurn[tid] != nil {
+                thinkingPlaceholderSince.removeValue(forKey: tid)
+            } else if !thinkingInFlightTurns.contains(tid) {
+                thinkingPlaceholderSince.removeValue(forKey: tid)
+                fetchThinkingForTurn(tid, force: false)
+            }
+        }
+    }
+
+    /// 当前显示窗口里, 某 turn_id 第一条 assistant 消息的 ts (用来决定 ThinkingChip 挂哪条上, 一 turn 只挂一次).
+    // 内容无关: 只判「这条 msg 是不是该 turn 的 thinking 挂载锚位」(一 turn 第一条 assistant).
+    // 卡片 / 占位 / 不显示 由渲染层按 thinkingByTurn / thinkingPlaceholderSince 决定 (原地切换不跳).
+    func isThinkingChipAnchor(_ msg: ChatMessage) -> Bool {
+        guard msg.role == "assistant", let tid = msg.turnId else { return false }
+        // 数据实测 (2026-06-12 /chat/history): 每个 turn_id 只对应一条 assistant 气泡 (case b, 每气泡独立 turn_id);
+        // 且 ChatMessage.id = localId ?? ts+role → 同 ts 同 role 会被 mergeUnique 按 id 去重, 不会出现"同 turn 多气泡同 ts 撞锚".
+        // 取该 turn 全部 assistant 气泡里 (ts,id) 最小一条作锚: 不依赖 messages 数组顺序 (比 .first(where:) 稳),
+        // 消除"切回前台数组重排 → .first 选错锚 → 已显示卡片整体不渲染"的脆弱点 (bug2 卡片消失候选根因).
+        let anchorId = messages
+            .filter { $0.turnId == tid && $0.role == "assistant" }
+            .min(by: { ($0.ts, $0.id) < ($1.ts, $1.id) })?.id
+        return anchorId == msg.id
     }
 
     private func notifyPollingAssistantMessages(_ records: [ChatMessage], existingIds: Set<String>) {
@@ -1621,19 +1845,25 @@ final class ChatViewModel: ObservableObject {
         let merged = mergeLocalCommandMessages(into: byId.values.sorted(by: Self.chatMessageAscending))
         self.messages = merged
         // 临时扩 visibleLimit 让 target 进 visible window
-        // build 199 fix: 给 jump 后 visibleLimit 加 hard cap 1500
-        // 防止跳到几千行老消息时 visibleLimit 长期膨胀 → 内存/diff 压力
-        // 用户回底部触发 resetVisibleWindowToRecent 收回默认 300
+        // 2026-06-11 jump-fix(2/3): 去掉 build 199 的 1500 hard cap——cap 让跳超老消息时
+        // target 永不进渲染窗, scrollTo 对不存在的 id 静默 no-op, 跳转必失败。
+        // 跳转正确性 > 暂时膨胀: 回底部 resetVisibleWindowToRecent 仍会收回 300,
+        // 膨胀只活到回底那一刻, 不是长期驻留。
+        var resolvedTargetId = targetMsg.id
         if let targetIdx = merged.firstIndex(where: { $0.id == targetMsg.id || $0.ts == ts }) {
-            let kJumpVisibleHardCap = 1500
-            let needWindow = min(merged.count - targetIdx + 50, kJumpVisibleHardCap)
+            // 乐观发送的本地版(id=localId)与 server 版(id=ts+role)指同一条消息时,
+            // scrollTo 必须用列表里真实存在的那个 id, 否则滚动目标不存在。
+            resolvedTargetId = merged[targetIdx].id
+            let needWindow = merged.count - targetIdx + 50
             if needWindow > visibleLimit {
                 visibleLimit = needWindow
             }
         }
         // 清搜索 + 设 scroll target 让 ChatListView 监听后滚到位
+        // 2026-06-11 jump-fix(1/3 公开版): 信号本就后置(数据+窗口落地后才发, 公开版无私版的预发 bug)。
+        // messages/visibleLimit 的 didSet 已同步 rebuild displayedRowsCache, onChange 触发时目标行必然已在列表里。
         clearSearch()
-        jumpScrollTarget = targetMsg.id
+        jumpScrollTarget = resolvedTargetId
     }
 
     /// 2026-05-07 用户 push: 紧急停止 chain. POST /chain/abort
@@ -1847,12 +2077,22 @@ final class ChatViewModel: ObservableObject {
         _ = try? await session.data(for: req)
     }
 
+    // 刀三 (僵尸修复 2026-06-12): 旧逻辑直接字符串截取 ISO ts 的 HH:mm, 优化消息 ts 存的是 UTC(Z)
+    // → 失败行时间戳显示 UTC 差整 8 小时(09:57 应为 17:57)。改走解析 ISO + 本地时区 DateFormatter。
+    // canonical 消息 ts 是 +08:00, 解析成 instant 后本地格式化仍是正确本地时间, 不回归。
+    private static let isoTimeParser: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
+    }()
+    private static let localHMFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm"; f.locale = Locale(identifier: "en_US_POSIX"); return f
+    }()
     private static func shortTime(_ ts: String) -> String {
-        let parts = ts.split(separator: "T")
-        if parts.count >= 2 {
-            return String(parts[1].prefix(5))
+        if let d = isoTimeParser.date(from: ts) ?? ISO8601DateFormatter().date(from: ts) {
+            return localHMFormatter.string(from: d)   // 本地时区 (DateFormatter 默认设备时区)
         }
-        return String(ts.prefix(5))
+        // 解析失败兜底: 老逻辑字符串截取
+        let parts = ts.split(separator: "T")
+        return parts.count >= 2 ? String(parts[1].prefix(5)) : String(ts.prefix(5))
     }
 
     private static func displayName(for role: String) -> String {
@@ -2046,7 +2286,7 @@ final class ChatViewModel: ObservableObject {
         if let secret = CcServerConfig.sharedSecret, !secret.isEmpty {
             req.setValue(secret, forHTTPHeaderField: "X-Auth-Token")
         }
-        req.timeoutInterval = 8
+        req.timeoutInterval = 15   // 刀二 (僵尸修复): 8→15, 弱网/抖动大时 8 秒误判失败率高
         var payload: [String: Any] = ["text": text]
         if let q = quotedTs { payload["quoted_ts"] = q }
         req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
@@ -2393,10 +2633,13 @@ final class ChatViewModel: ObservableObject {
             }
         }
 
+        // 刀一 (僵尸修复 2026-06-12): 老僵尸的 canonical 证据可能滚出内存 messages 窗口(load 仅 latest 200)
+        // → 只查内存永远洗不清白。除内存外再查 GRDB(chatStore.latest 拉 canonical)。对消窗 ±120→±600。
+        let dbCanonicals = chatStore.latest(limit: 5000).filter { $0.localId == nil }
         let locals = messages.filter { $0.localId?.hasPrefix("local-") == true }
         for local in locals {
             guard let localDate = formatter.date(from: local.ts) else { continue }
-            let matchedCanonical = messages.contains { candidate in
+            let isMatch: (ChatMessage) -> Bool = { candidate in
                 guard candidate.localId == nil,
                       candidate.role == local.role,
                       candidate.text == local.text,
@@ -2404,8 +2647,9 @@ final class ChatViewModel: ObservableObject {
                       let candidateDate = formatter.date(from: candidate.ts) else {
                     return false
                 }
-                return abs(candidateDate.timeIntervalSince(localDate)) <= 120
+                return abs(candidateDate.timeIntervalSince(localDate)) <= 600
             }
+            let matchedCanonical = messages.contains(where: isMatch) || dbCanonicals.contains(where: isMatch)
             if matchedCanonical {
                 messages.removeAll { $0.id == local.id }
                 sendingIds.remove(local.id)
@@ -2840,9 +3084,35 @@ struct ChatView: View {
             photoItems = []
             Task {
                 // 单选/多选统一进缩略图预览条，用户可写 caption 后一起发
+                // 2026-06-06 修发图静默失败: loadTransferable 对 iCloud 未下载的原图会间歇性失败,
+                // 旧代码 try? 吞错且无 else, 失败的图静默消失 (用户报告"选图后没反应")。
+                // 现在失败自动重试一次 (原图缓存后第二次多半成功), 仍失败用 lastError 提示。
+                var failedCount = 0
                 for item in items {
-                    if let data = try? await item.loadTransferable(type: Data.self) {
+                    var loaded: Data? = nil
+                    do {
+                        loaded = try await item.loadTransferable(type: Data.self)
+                    } catch {
+                        print("[photo] loadTransferable failed: \(error)")
+                    }
+                    if loaded == nil {
+                        try? await Task.sleep(nanoseconds: 1_200_000_000)
+                        do {
+                            loaded = try await item.loadTransferable(type: Data.self)
+                        } catch {
+                            print("[photo] loadTransferable retry failed: \(error)")
+                        }
+                    }
+                    if let data = loaded {
                         await MainActor.run { selectedImagePreviews.append(ImagePreview(data: data)) }
+                    } else {
+                        failedCount += 1
+                    }
+                }
+                if failedCount > 0 {
+                    let n = failedCount
+                    await MainActor.run {
+                        vm.lastError = "\(n) 张图片加载失败，原图可能还在 iCloud，请稍后重选"
                     }
                 }
             }
@@ -2991,6 +3261,7 @@ struct ChatView: View {
             vm.setPollingActive(phase == .active)
             if phase == .active {
                 vm.reconcileLocalSendState()
+                vm.reconcileThinkingOnForeground()   // H3 (bug2): 清不死占位 / 重拉死任务 / 保真在途
                 Task { await vm.clearUnread() }
             }
         }
@@ -3895,10 +4166,15 @@ private struct ChatListView: View {
                         scrollToBottom(proxy: proxy, delay: 0.05)
                         return
                     }
-                    if (isUserScrolledUp || suppressActive) && newOthersCount > 0 {
-                        // 用户在上面看历史 / loadEarlier 期间 不 auto scroll 累计 unread (只算别人发的)
-                        if !suppressActive { unreadCount += newOthersCount }
-                    } else {
+                    // 2026-06-11 jump-fix(公开版对位): jump 期间(jumpScrollTarget != nil)不 auto scroll-bottom。
+                    // 公开版无私版的 jumpInProgressUntil/suppressingProgrammaticJump, 用 jumpScrollTarget 等价守卫
+                    // (跟下方 displayedRowsCache.count onChange 的 jumpScrollTarget==nil 守卫同一惯用法), 否则
+                    // 跳老消息时 merge 撑大 messages.count → 本 onChange else 分支 scrollToBottom+resetVisibleWindow
+                    // 会把刚扩的窗收回 300 并弹回底, 三刀全白做。jumpScrollTarget==nil(99% 时)守卫是 no-op 零回归。
+                    if (isUserScrolledUp || suppressActive || vm.jumpScrollTarget != nil) && newOthersCount > 0 {
+                        // 用户在上面看历史 / loadEarlier / jump 期间 不 auto scroll 累计 unread (只算别人发的)
+                        if !suppressActive && vm.jumpScrollTarget == nil { unreadCount += newOthersCount }
+                    } else if vm.jumpScrollTarget == nil {
                         unreadCount = 0
                         vm.resetVisibleWindowToRecent()
                         // 不带动画 直接 scroll 不再跟 cache append 撞 视觉上稳
@@ -3924,12 +4200,18 @@ private struct ChatListView: View {
                 }
                 .onChange(of: vm.jumpScrollTarget) { _, target in
                     guard let target else { return }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                        withAnimation(.easeOut(duration: 0.3)) {
-                            proxy.scrollTo(target, anchor: .center)
-                        }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                            vm.jumpScrollTarget = nil
+                    // 2026-06-11 jump-fix(3/3): 单次 scrollTo 改三连校准。LazyVStack 未渲染行
+                    // 的高度是估算值, 一次 scrollTo 落点必偏(文本/图片/工具行混排时尤甚),
+                    // 这就是"跳了但停在错的位置"的根。首滚把目标附近真实渲染出来, 二三滚
+                    // 基于真实行高落准——LazyVStack scrollTo 偏移的标准 workaround。
+                    // guard 比对 target: 期间用户又点了别的跳转就让位给新目标的三连滚。
+                    for (i, delay) in [0.15, 0.55, 1.1].enumerated() {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                            guard vm.jumpScrollTarget == target else { return }
+                            withAnimation(i == 0 ? .easeOut(duration: 0.3) : nil) {
+                                proxy.scrollTo(target, anchor: .center)
+                            }
+                            if i == 2 { vm.jumpScrollTarget = nil }
                         }
                     }
                 }
@@ -3983,7 +4265,18 @@ private struct ChatListView: View {
                     removal: .opacity
                 ))
         case .message(let msg, let showTime):
-            ChatMessageListRow(
+            VStack(alignment: .leading, spacing: 2) {
+                // Phase 2/3 (thinking-stream-render) + 2026-06-11 占位动画: 该 turn 第一条 assistant 消息上方,
+                // thinking 已拉到 → 折叠卡片; 还在路上 → 「正在思考」占位 (原地, 拉到内容卡片替占位不跳).
+                if vm.isThinkingChipAnchor(msg), let tid = msg.turnId {
+                    if let think = vm.thinkingByTurn[tid] {
+                        ThinkingChip(text: think)
+                    } else if vm.showsThinkingPlaceholder(tid) {
+                        ThinkingPlaceholder()
+                            .transition(.opacity)
+                    }
+                }
+                ChatMessageListRow(
                 message: msg,
                 showTime: showTime,
                 multiSelectMode: vm.multiSelectMode,
@@ -4020,7 +4313,8 @@ private struct ChatListView: View {
                 sendStatus: vm.sendStatus(forId: msg.id),
                 onRetry: msg.isUser ? { vm.retryFailedSend(id: msg.id) } : nil,
                 onDiscardFailed: msg.isUser ? { vm.discardFailedSend(id: msg.id) } : nil
-            )
+                )
+            }
             .id(msg.id)
             .padding(.vertical, 4)
             .padding(.trailing, 12)
@@ -4344,6 +4638,120 @@ private struct ChatErrorRow: View {
             .foregroundStyle(.red)
             .padding(.horizontal, 12)
             .padding(.vertical, 4)
+    }
+}
+
+// Phase 2 (thinking-stream-render, 方案 C): assistant turn 的 thinking 折叠卡片.
+// 默认折叠 — 一行 italic 灰 "thinking ▸" + 前 40 字预览. tap 展开看完整 thinking, 再 tap 收起.
+// 左侧细 accent 竖条 + dot 做时间轴侧栏感 (方案 C 轻量版), 不重排已有 bubble 布局.
+private struct ThinkingChip: View {
+    let text: String
+    @State private var expanded: Bool = false
+
+    private var preview: String {
+        let oneLine = text.replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return String(oneLine.prefix(40))
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            // 时间轴侧栏 (方案 C): muted dot + 细灰线
+            VStack(spacing: 0) {
+                Circle()
+                    .fill(Color.ccTextDim.opacity(0.55))
+                    .frame(width: 6, height: 6)
+                    .padding(.top, 5)
+                Rectangle()
+                    .fill(Color.ccTextDim.opacity(0.22))
+                    .frame(width: 1)
+                    .frame(maxHeight: .infinity)
+            }
+            .frame(width: 16)
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { expanded.toggle() }
+            } label: {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 4) {
+                        Text("thinking")
+                            .font(.ccSerifAdaptive(size: 12))
+                            .italic()
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                        if !expanded {
+                            Text(preview)
+                                .font(.ccSerifAdaptive(size: 12))
+                                .italic()
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                    }
+                    .foregroundStyle(Color.ccTextDim)
+
+                    if expanded {
+                        Text(text)
+                            .font(.ccSerifAdaptive(size: 13))
+                            .foregroundStyle(Color.ccTextDim)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                            .background(Color.ccCard.opacity(0.6))
+                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            Spacer(minLength: 0)
+        }
+        .padding(.trailing, 12)
+    }
+}
+
+// 2026-06-11 thinking 占位动画: 卡片的 loading 态. 复用 ThinkingChip 的时间轴侧栏 (dot + 细灰线),
+// 右侧「thinking」italic + 三个错峰呼吸的小圆点. 拉到内容时原地被 ThinkingChip 替掉, 同左栏不横跳.
+private struct ThinkingPlaceholder: View {
+    @State private var animate = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            VStack(spacing: 0) {
+                Circle()
+                    .fill(Color.ccTextDim.opacity(0.55))
+                    .frame(width: 6, height: 6)
+                    .padding(.top, 5)
+                Rectangle()
+                    .fill(Color.ccTextDim.opacity(0.22))
+                    .frame(width: 1)
+                    .frame(maxHeight: .infinity)
+            }
+            .frame(width: 16)
+
+            HStack(spacing: 5) {
+                Text("thinking")
+                    .font(.ccSerifAdaptive(size: 12))
+                    .italic()
+                HStack(spacing: 3) {
+                    ForEach(0..<3, id: \.self) { i in
+                        Circle()
+                            .fill(Color.ccTextDim)
+                            .frame(width: 4, height: 4)
+                            .opacity(animate ? 1.0 : 0.25)
+                            .animation(
+                                .easeInOut(duration: 0.55)
+                                    .repeatForever(autoreverses: true)
+                                    .delay(Double(i) * 0.18),
+                                value: animate
+                            )
+                    }
+                }
+                .padding(.top, 1)
+            }
+            .foregroundStyle(Color.ccTextDim)
+            Spacer(minLength: 0)
+        }
+        .padding(.trailing, 12)
+        .onAppear { animate = true }
     }
 }
 

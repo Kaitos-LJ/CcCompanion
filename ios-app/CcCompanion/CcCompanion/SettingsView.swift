@@ -322,6 +322,224 @@ final class CcSettingsViewModel: ObservableObject {
     // Phase 设置大砍 (2026-05-11) — postChain helper 删 (软清/硬重启 UI 已砍, 搬到终端 tab phase E).
 }
 
+// MARK: - 订阅用量面板 (ai-usage-monitor 8796, 2026-06-12 款式A — 公开版 only Claude)
+// 数据源跟旧 UsageSection(8795 OTS 统计) 不同: 8796 ai-usage-monitor 给 Claude 订阅窗百分比.
+// Claude 订阅窗挂 ccusage.rate_limits 下(不在顶层 claude 键).
+// 进区块 onAppear 拉一次 + 手动刷新, 不常驻轮询(设置页场景省电省请求).
+// 生态: 服务端装 waterside0219/ai-usage-monitor, 本卡渲染它的数据. 配置见 docs/USAGE_PANEL_SETUP.md.
+
+private struct SubUsageResponse: Codable {
+    let ok: Bool?
+    let ccusage: SubCcusage?
+}
+private struct SubCcusage: Codable {
+    let available: Bool?
+    let rateLimits: SubRateLimits?
+    enum CodingKeys: String, CodingKey {
+        case available
+        case rateLimits = "rate_limits"
+    }
+}
+private struct SubRateLimits: Codable {
+    let available: Bool?
+    let stale: Bool?
+    let fiveHour: SubWindow?
+    let sevenDay: SubWindow?
+    enum CodingKeys: String, CodingKey {
+        case available, stale
+        case fiveHour = "five_hour"
+        case sevenDay = "seven_day"
+    }
+}
+private struct SubWindow: Codable {
+    let usedPercent: Double?
+    let resetAfterSeconds: Double?
+    enum CodingKeys: String, CodingKey {
+        case usedPercent = "used_percent"
+        case resetAfterSeconds = "reset_after_seconds"
+    }
+}
+
+@MainActor
+final class SubUsageViewModel: ObservableObject {
+    @Published fileprivate var response: SubUsageResponse? = nil
+    @Published var loading: Bool = false
+    @Published var failed: Bool = false
+
+    // host 跟着现有 server 配置走, 仅换端口 8796, 不硬编码 IP.
+    private var monitorURL: URL? {
+        var comps = URLComponents(url: CcServerConfig.serverURL, resolvingAgainstBaseURL: false)
+        comps?.port = 8796
+        comps?.path = "/usage"
+        return comps?.url
+    }
+
+    func fetch() async {
+        guard let url = monitorURL else { failed = true; return }
+        loading = true
+        defer { loading = false }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 35   // ccusage 冷跑可达 9s, server 端 timeout 30s, 留余量
+        if let secret = CcServerConfig.sharedSecret, !secret.isEmpty {
+            req.setValue(secret, forHTTPHeaderField: "X-Auth-Token")
+        }
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                failed = (response == nil); return
+            }
+            response = try JSONDecoder().decode(SubUsageResponse.self, from: data)
+            failed = false
+        } catch {
+            failed = (response == nil)   // 已有数据时保留旧数据不闪占位
+        }
+    }
+}
+
+struct SubUsageSection: View {
+    @StateObject private var vm = SubUsageViewModel()
+
+    // 未配置态指引文档 (服务端怎么装 ai-usage-monitor).
+    private static let setupDocURL = URL(string: "https://github.com/CyberSealNull/CcCompanion/blob/main/docs/USAGE_PANEL_SETUP.md")
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("用量", systemImage: "gauge")
+                    .font(.ccSerifAdaptive(size: 17, weight: .semibold))
+                    .foregroundStyle(Color.ccAccent)
+                Spacer()
+                if vm.loading && vm.response == nil {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button {
+                        Task { await vm.fetch() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.ccSerifAdaptive(size: 12))
+                            .foregroundStyle(Color.ccTextDim)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            if let resp = vm.response {
+                // ===== CLAUDE 订阅区 =====
+                let rl = resp.ccusage?.rateLimits
+                sectionTitle("CLAUDE 订阅", stale: rl?.stale == true)
+                if let rl, rl.available != false {
+                    usageRow(label: "5 小时窗", window: rl.fiveHour)
+                    usageRow(label: "7 天窗", window: rl.sevenDay)
+                } else {
+                    unavailableRow("Claude 订阅数据暂不可用")
+                }
+            } else if vm.failed {
+                // ===== 未配置态指引 (公开版新增) =====
+                unconfiguredGuide()
+            } else if !vm.loading {
+                Text("用量数据加载中…")
+                    .font(.ccSerifAdaptive(size: 11))
+                    .foregroundStyle(Color.ccTextDim)
+            }
+        }
+        .padding(14)
+        .background(Color.ccCard)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .onAppear { Task { await vm.fetch() } }   // 进区块拉一次, 不常驻轮询
+    }
+
+    @ViewBuilder
+    private func unconfiguredGuide() -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("查看 Claude Code 的订阅用量与重置时间。需在你的服务器上配置用量服务，约 5 分钟。")
+                .font(.ccSerifAdaptive(size: 12))
+                .foregroundStyle(Color.ccTextDim)
+                .fixedSize(horizontal: false, vertical: true)
+            if let url = Self.setupDocURL {
+                Link("查看配置指引 →", destination: url)
+                    .font(.ccSerifAdaptive(size: 13, weight: .semibold))
+                    .foregroundStyle(Color.ccAccent)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private func sectionTitle(_ title: String, stale: Bool) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .font(.ccSerifAdaptive(size: 12, weight: .semibold))
+                .foregroundStyle(Color.ccTextDim)
+                .tracking(0.5)
+            if stale {
+                Text("· 数据可能过期")
+                    .font(.ccSerifAdaptive(size: 10))
+                    .foregroundStyle(Color.ccTextDim.opacity(0.8))
+            }
+            Spacer()
+        }
+        .padding(.top, 2)
+    }
+
+    @ViewBuilder
+    private func usageRow(label: String, window: SubWindow?) -> some View {
+        let pct = max(0, min(100, window?.usedPercent ?? 0))
+        HStack(spacing: 10) {
+            Text(label)
+                .font(.ccSerifAdaptive(size: 13))
+                .foregroundStyle(Color.ccText)
+                .frame(width: 64, alignment: .leading)
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(Color.ccTextDim.opacity(0.18))
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(barColor(pct))
+                        .frame(width: max(2, geo.size.width * pct / 100))
+                }
+            }
+            .frame(height: 8)
+            Text("\(Int(pct.rounded()))%")
+                .font(.ccSerifAdaptive(size: 13, weight: .semibold))
+                .foregroundStyle(barColor(pct))
+                .frame(width: 42, alignment: .trailing)
+            Text(resetText(window?.resetAfterSeconds))
+                .font(.ccSerifAdaptive(size: 10))
+                .foregroundStyle(Color.ccTextDim)
+                .frame(width: 76, alignment: .trailing)
+        }
+        .padding(.vertical, 3)
+    }
+
+    @ViewBuilder
+    private func unavailableRow(_ text: String) -> some View {
+        Text(text)
+            .font(.ccSerifAdaptive(size: 11))
+            .foregroundStyle(Color.ccTextDim)
+            .padding(.vertical, 4)
+    }
+
+    // 进度条配色: <60 主题 accent / 60-90 黄(≈#D9A441) / ≥90 红(≈#C25450).
+    private func barColor(_ pct: Double) -> Color {
+        if pct >= 90 { return Color(red: 0.761, green: 0.329, blue: 0.314) }
+        if pct >= 60 { return Color(red: 0.851, green: 0.643, blue: 0.255) }
+        return Color.ccAccent
+    }
+
+    // reset_after_seconds → 「X天Yh / XhYm / Xm 后刷新」.
+    private func resetText(_ secs: Double?) -> String {
+        guard let s = secs, s > 0 else { return "已刷新" }
+        let total = Int(s)
+        let days = total / 86400
+        let hours = (total % 86400) / 3600
+        let mins = (total % 3600) / 60
+        if days >= 1 { return "\(days)天\(hours)h 后刷新" }
+        if hours >= 1 { return "\(hours)h\(mins)m 后刷新" }
+        return "\(mins)m 后刷新"
+    }
+}
+
 struct CcSettingsView: View {
     @StateObject private var vm = CcSettingsViewModel()
 
@@ -358,6 +576,7 @@ struct CcSettingsView: View {
     @State private var showHapticInfo: Bool = false
     // Build 215 S2 — 群聊编辑 sheet 状态
     @State private var showGroupSettingsEdit: Bool = false
+    @State private var showSessionOrder: Bool = false  // build226 终端 session 调序
     // Build 215 S1 — 群聊背景 PHPicker state
     @State private var groupBgPickerPresented: Bool = false
     @State private var groupBgRefreshTick: Int = 0
@@ -462,6 +681,9 @@ struct CcSettingsView: View {
                 // Group 3 SERVER (Phase multi-server fallback 2026-05-11 — 多 endpoint + auto fallback)
                 serverEndpointsSection
 
+                // 订阅用量面板 (ai-usage-monitor 8796) — Claude Code 订阅窗百分比, 公开版 only Claude
+                SubUsageSection()
+
                 // Group 4 CONNECTIONS (ccc 不要)
 
                 // Group 5 VAULT — 砍
@@ -489,6 +711,29 @@ struct CcSettingsView: View {
                         .pickerStyle(.segmented)
                         .padding(.vertical, 4)
                     }
+                }
+
+                // 终端 session 顺序 (build226) — 拖动自定义终端 tab 的 session 排序
+                section("终端") {
+                    Button {
+                        showSessionOrder = true
+                    } label: {
+                        HStack {
+                            Text("session 顺序")
+                                .font(.ccSerifAdaptive(size: 15))
+                                .foregroundStyle(Color.ccText)
+                            Spacer()
+                            Text("拖动调序")
+                                .font(.system(.callout, design: .monospaced))
+                                .foregroundStyle(Color.ccTextDim)
+                            Image(systemName: "chevron.right")
+                                .font(.ccSerifAdaptive(size: 12))
+                                .foregroundStyle(Color.ccTextDim)
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 12)
+                    }
+                    .buttonStyle(.plain)
                 }
 
                 // Group 7 FEATURES (大砍版)
@@ -589,6 +834,10 @@ struct CcSettingsView: View {
             Button("好") {}
         } message: {
             Text("当 Claude Code 在终端等你按 y/n 同意时（例如 proceed?、continue?、[y/n]、✏️ 编辑提示等），会触发一次短触感和提示音。帮你切到别的 App 时不漏掉 prompt。\n\n关掉就只看屏幕，不振不响。")
+        }
+        // build226 — 终端 session 调序 sheet
+        .sheet(isPresented: $showSessionOrder) {
+            TerminalSessionOrderView()
         }
         // Build 215 S2 — 群聊编辑 sheet (头像 + 名称 同时编辑, 保存才落)
         .sheet(isPresented: $showGroupSettingsEdit) {
@@ -2038,6 +2287,119 @@ enum GroupMemberSyncClient {
             return SyncResult(ok: true, detail: "")
         } catch {
             return SyncResult(ok: false, detail: "后端\(action)网络错: \(error.localizedDescription)")
+        }
+    }
+}
+
+// build226 — 终端 session 顺序调序视图. 拖动重排 → 保存 POST /tmux/sessions/order.
+// 服务端 /tmux/sessions 之后按 saved order 返回, 终端 tab 第一个即默认 session.
+struct TerminalSessionOrderView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var sessions: [String] = []
+    @State private var loading: Bool = true
+    @State private var saving: Bool = false
+    @State private var toast: String? = nil
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if loading {
+                    ProgressView("加载中…")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if sessions.isEmpty {
+                    Text("没有可调序的 session")
+                        .foregroundStyle(Color.ccTextDim)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    List {
+                        Section {
+                            ForEach(sessions, id: \.self) { s in
+                                HStack {
+                                    Image(systemName: "line.3.horizontal")
+                                        .foregroundStyle(Color.ccTextDim)
+                                    Text(s)
+                                        .font(.system(.body, design: .monospaced))
+                                }
+                            }
+                            .onMove { from, to in
+                                sessions.move(fromOffsets: from, toOffset: to)
+                            }
+                        } header: {
+                            Text("拖动右侧把手调整顺序，第一个即终端默认 session")
+                        }
+                    }
+                    .environment(\.editMode, .constant(.active))
+                }
+            }
+            .navigationTitle("终端 session 顺序")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(saving ? "保存中…" : "保存") {
+                        Task { await save() }
+                    }
+                    .disabled(saving || sessions.isEmpty)
+                }
+            }
+            .overlay(alignment: .bottom) {
+                if let t = toast {
+                    Text(t)
+                        .font(.ccSerifAdaptive(size: 13))
+                        .padding(.horizontal, 14).padding(.vertical, 8)
+                        .background(Color.ccCard)
+                        .foregroundStyle(Color.ccAccent)
+                        .clipShape(Capsule())
+                        .padding(.bottom, 24)
+                }
+            }
+            .task { await load() }
+        }
+    }
+
+    private func load() async {
+        loading = true
+        // /tmux/sessions 已按 saved order 返回, 直接用它当当前顺序展示。
+        let url = CcServerConfig.serverURL.appendingPathComponent("tmux/sessions")
+        do {
+            let (data, _) = try await URLSession.shared.data(for: CcServerConfig.authenticatedRequest(url: url))
+            if let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let arr = obj["sessions"] as? [String] {
+                sessions = arr
+            }
+        } catch {
+            // 静默
+        }
+        loading = false
+    }
+
+    private func save() async {
+        saving = true
+        defer { saving = false }
+        let url = CcServerConfig.serverURL.appendingPathComponent("tmux/sessions/order")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let secret = CcServerConfig.sharedSecret, !secret.isEmpty {
+            req.setValue(secret, forHTTPHeaderField: "X-Auth-Token")
+        }
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["order": sessions])
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            if (200...299).contains(code),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               obj["ok"] as? Bool == true {
+                toast = "已保存"
+                try? await Task.sleep(nanoseconds: 600_000_000)
+                dismiss()
+            } else {
+                toast = "保存失败 (\(code))"
+            }
+        } catch {
+            toast = "保存失败: \(error.localizedDescription)"
         }
     }
 }
