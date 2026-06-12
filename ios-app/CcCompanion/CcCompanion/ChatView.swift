@@ -645,7 +645,18 @@ final class ChatViewModel: ObservableObject {
     // 正在重试循环中的 turn_id, 防 push + poll 双触发起重复循环.
     private var thinkingInFlightTurns: Set<String> = []
     // 2026-06-11 thinking 占位动画: 该 turn thinking 在路上但还没拉到 → anchor 位显示「正在思考」占位.
-    @Published private(set) var thinkingPlaceholderTurns: Set<String> = []
+    // 2026-06-12 bug 修: Set<String> → [tid: 插入时刻]. 渲染层无视超 thinkingPlaceholderMaxAge 的过期项,
+    // scenePhase 转 .active / 每次 poll tick 主动清扫, 根除"任务死掉占位永不消失"(H3 / bug2 不死占位).
+    @Published private(set) var thinkingPlaceholderSince: [String: Date] = [:]
+    // 占位最长存活: 与 ~89s give-up 退避窗对齐略宽, 超过即视为僵尸占位清掉.
+    private let thinkingPlaceholderMaxAge: TimeInterval = 95
+    // 新鲜度门 (H1 / bug1): 仅当 turn 第一条气泡 ts 距 now ≤ 此窗才给占位, 历史回填静默拉卡片不冒占位.
+    private let thinkingFreshTurnWindow: TimeInterval = 120
+    // 渲染层判定: 该 turn 当前是否应显示占位 (存在且未过期).
+    func showsThinkingPlaceholder(_ tid: String) -> Bool {
+        guard let since = thinkingPlaceholderSince[tid] else { return false }
+        return Date().timeIntervalSince(since) < thinkingPlaceholderMaxAge
+    }
     // 连续 N 个 turn 拉空 → 判定此 server 无 thinking 管道, 后续不显示占位 (UserDefaults 持久, 真拉到内容即重置).
     private var consecutiveEmptyThinkingTurns: Int = 0
     private let thinkingEmptyTurnThreshold = 3
@@ -1029,6 +1040,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     private func pollOnce() async {
+        sweepStaleThinkingPlaceholders()   // H3 兜底: 每 tick 清扫僵尸占位, 不依赖 scenePhase 变化
         do {
             let response = try await ChatNetworkClient.shared.fetchPoll(since: lastTs, etag: settingsEtag)
             recordNetworkSuccess()
@@ -1077,6 +1089,19 @@ final class ChatViewModel: ObservableObject {
     //      observer 调到这里, line guard 见 fetchedTurns.contains(tid) 直接短路, push 永远救不回这条 turn.
     //   实测: silent push 对有效 token PROD status=200 真送达, 所以问题不在 push 没到, 在到了被 give-up 标记挡掉.
     //   修法: ① 退避窗拉到累计 ~89s 覆盖晚到 30s 的窗 (不靠 push 也自愈); ② push 走 force=true 清掉 give-up 标记补拉.
+    // 占位新鲜度 (H1 / bug1): 该 turn 第一条 assistant 气泡 ts 距 now ≤ thinkingFreshTurnWindow 才算新鲜.
+    // 冷启动 / 切回前台首 poll 的历史批量回填里, 老 turn 不新鲜 → 静默拉卡片但不冒占位, 修"历史气泡集体冒占位".
+    private static let thinkingFreshFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
+    }()
+    private func isFreshThinkingTurn(_ tid: String) -> Bool {
+        guard let firstTs = messages.first(where: { $0.turnId == tid && $0.role == "assistant" })?.ts else {
+            return true   // 气泡还没落地 (push 先于 chat record) → 视作新鲜, 允许占位
+        }
+        guard let date = Self.parseChatDate(firstTs, formatter: Self.thinkingFreshFormatter) else { return true }
+        return Date().timeIntervalSince(date) <= thinkingFreshTurnWindow
+    }
+
     func fetchThinkingForTurn(_ tid: String, force: Bool = false) {
         guard !tid.isEmpty else { return }
         if thinkingByTurn[tid] != nil { return }          // 已成功拉到 → 不重复
@@ -1084,8 +1109,9 @@ final class ChatViewModel: ObservableObject {
         if force { thinkingFetchedTurns.remove(tid) }
         if thinkingFetchedTurns.contains(tid) || thinkingInFlightTurns.contains(tid) { return }
         thinkingInFlightTurns.insert(tid)
-        // 占位: 初次 poll 路 (非 force push 路) 且未判定无管道时, 该 turn anchor 位显示「正在思考」占位.
-        if !force && !noThinkingPipeline { thinkingPlaceholderTurns.insert(tid) }
+        // 占位: 初次 poll 路 (非 force push 路) + 未判定无管道 + 该 turn 新鲜 (H1) 才冒占位.
+        // 历史回填的老 turn 不新鲜 → 只静默 fetch (卡片该冒还冒), 不插占位 → 历史气泡零占位.
+        if !force && !noThinkingPipeline && isFreshThinkingTurn(tid) { thinkingPlaceholderSince[tid] = Date() }
         Task { [weak self] in
             // 退避累计 ~89s: 0,1,3,6,11,19,29,44,64,89s — 在 thinking 晚到 ~30s 前后多次 catch, 不靠 flaky push.
             let delays: [UInt64] = [0, 1, 2, 3, 5, 8, 10, 15, 20, 25].map { UInt64($0) * 1_000_000_000 }
@@ -1108,7 +1134,7 @@ final class ChatViewModel: ObservableObject {
         thinkingByTurn[tid] = text
         thinkingFetchedTurns.insert(tid)
         thinkingInFlightTurns.remove(tid)
-        thinkingPlaceholderTurns.remove(tid)
+        thinkingPlaceholderSince.removeValue(forKey: tid)
         consecutiveEmptyThinkingTurns = 0
         noThinkingPipeline = false
     }
@@ -1117,20 +1143,55 @@ final class ChatViewModel: ObservableObject {
     @MainActor private func thinkingTurnGaveUp(_ tid: String) {
         thinkingFetchedTurns.insert(tid)
         thinkingInFlightTurns.remove(tid)
-        withAnimation(.easeOut(duration: 0.45)) { _ = thinkingPlaceholderTurns.remove(tid) }
+        withAnimation(.easeOut(duration: 0.45)) { _ = thinkingPlaceholderSince.removeValue(forKey: tid) }
         if noThinkingPipeline == false {
             consecutiveEmptyThinkingTurns += 1
             if consecutiveEmptyThinkingTurns >= thinkingEmptyTurnThreshold { noThinkingPipeline = true }
         }
     }
 
+    // H3 兜底 (bug2 不死占位): 清扫超 maxAge 的僵尸占位 (任务被取消 / weak self 拿空 / 竞态没跑到 give-up),
+    // 并解开卡死的 in-flight 标记, 允许后续 push/poll 重新拉. 每次 poll tick + scenePhase 转 .active 调.
+    @MainActor func sweepStaleThinkingPlaceholders() {
+        let now = Date()
+        let stale = thinkingPlaceholderSince.compactMap {
+            now.timeIntervalSince($0.value) >= thinkingPlaceholderMaxAge ? $0.key : nil
+        }
+        guard !stale.isEmpty else { return }
+        withAnimation(.easeOut(duration: 0.45)) {
+            for tid in stale { thinkingPlaceholderSince.removeValue(forKey: tid) }
+        }
+        for tid in stale { thinkingInFlightTurns.remove(tid) }
+    }
+
+    // H3 (bug2): 切回前台校正占位. 三类处理: ① 已有卡片 → 清残留占位; ② 占位还在但任务没了 (后台被取消) →
+    // 清旧占位 + force=false 重新发起 (重置占位戳 + 退避); ③ 任务仍在途 → 保留占位 (在途行为正常, 符合验收4).
+    // 根除"切屏回来留一个永远在动的占位", 不误杀真在途的占位.
+    @MainActor func reconcileThinkingOnForeground() {
+        sweepStaleThinkingPlaceholders()
+        for tid in Array(thinkingPlaceholderSince.keys) {
+            if thinkingByTurn[tid] != nil {
+                thinkingPlaceholderSince.removeValue(forKey: tid)
+            } else if !thinkingInFlightTurns.contains(tid) {
+                thinkingPlaceholderSince.removeValue(forKey: tid)
+                fetchThinkingForTurn(tid, force: false)
+            }
+        }
+    }
+
     /// 当前显示窗口里, 某 turn_id 第一条 assistant 消息的 ts (用来决定 ThinkingChip 挂哪条上, 一 turn 只挂一次).
     // 内容无关: 只判「这条 msg 是不是该 turn 的 thinking 挂载锚位」(一 turn 第一条 assistant).
-    // 卡片 / 占位 / 不显示 由渲染层按 thinkingByTurn / thinkingPlaceholderTurns 决定 (原地切换不跳).
+    // 卡片 / 占位 / 不显示 由渲染层按 thinkingByTurn / thinkingPlaceholderSince 决定 (原地切换不跳).
     func isThinkingChipAnchor(_ msg: ChatMessage) -> Bool {
         guard msg.role == "assistant", let tid = msg.turnId else { return false }
-        let firstTsForTurn = messages.first(where: { $0.turnId == tid && $0.role == "assistant" })?.ts
-        return firstTsForTurn == msg.ts
+        // 数据实测 (2026-06-12 /chat/history): 每个 turn_id 只对应一条 assistant 气泡 (case b, 每气泡独立 turn_id);
+        // 且 ChatMessage.id = localId ?? ts+role → 同 ts 同 role 会被 mergeUnique 按 id 去重, 不会出现"同 turn 多气泡同 ts 撞锚".
+        // 取该 turn 全部 assistant 气泡里 (ts,id) 最小一条作锚: 不依赖 messages 数组顺序 (比 .first(where:) 稳),
+        // 消除"切回前台数组重排 → .first 选错锚 → 已显示卡片整体不渲染"的脆弱点 (bug2 卡片消失候选根因).
+        let anchorId = messages
+            .filter { $0.turnId == tid && $0.role == "assistant" }
+            .min(by: { ($0.ts, $0.id) < ($1.ts, $1.id) })?.id
+        return anchorId == msg.id
     }
 
     private func notifyPollingAssistantMessages(_ records: [ChatMessage], existingIds: Set<String>) {
@@ -3157,6 +3218,7 @@ struct ChatView: View {
             vm.setPollingActive(phase == .active)
             if phase == .active {
                 vm.reconcileLocalSendState()
+                vm.reconcileThinkingOnForeground()   // H3 (bug2): 清不死占位 / 重拉死任务 / 保真在途
                 Task { await vm.clearUnread() }
             }
         }
@@ -4155,7 +4217,7 @@ private struct ChatListView: View {
                 if vm.isThinkingChipAnchor(msg), let tid = msg.turnId {
                     if let think = vm.thinkingByTurn[tid] {
                         ThinkingChip(text: think)
-                    } else if vm.thinkingPlaceholderTurns.contains(tid) {
+                    } else if vm.showsThinkingPlaceholder(tid) {
                         ThinkingPlaceholder()
                             .transition(.opacity)
                     }
